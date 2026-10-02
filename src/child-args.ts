@@ -3,10 +3,11 @@
  * thinking resolution, and the provider-extension detection.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { getPackageDir } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import type { PiTeamConfig } from "./types.ts";
 
@@ -80,10 +81,71 @@ export function resolveChildExtensions(
 	return existsSync(candidate) ? [candidate] : [];
 }
 
-/** Absolute path to the pi CLI entry point. */
+/**
+ * The CLI entry point of the pi package in `pkgDir`. Reads "bin.pi" from
+ * package.json first, then falls back to the known dist paths.
+ */
+export function cliPathFromPackageDir(pkgDir: string): string | undefined {
+	const pkgJson = path.join(pkgDir, "package.json");
+	if (existsSync(pkgJson)) {
+		try {
+			const pkg = JSON.parse(readFileSync(pkgJson, "utf8")) as { bin?: string | Record<string, string> };
+			const bin = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.pi;
+			if (bin) {
+				const candidate = path.resolve(pkgDir, bin);
+				if (existsSync(candidate)) return candidate;
+			}
+		} catch {
+			// Malformed package.json: fall through to the dist paths.
+		}
+	}
+	for (const relative of ["dist/cli.js", "dist/bundle/cli.js"]) {
+		const candidate = path.join(pkgDir, relative);
+		if (existsSync(candidate)) return candidate;
+	}
+	return undefined;
+}
+
+/**
+ * Absolute path to the pi CLI entry point.
+ *
+ * The extension imports @earendil-works/pi-coding-agent through the host's
+ * jiti alias, not through native Node resolution. Because of this,
+ * `import.meta.resolve()` fails when the extension has no node_modules of its
+ * own (Installed as a package). `getPackageDir()` returns the running pi
+ * install, which is the correct source of the CLI.
+ */
 export function resolveCliPath(): string {
-	const resolved = import.meta.resolve("@earendil-works/pi-coding-agent");
-	return path.join(path.dirname(fileURLToPath(resolved)), "cli.js");
+	// 1. The running pi install, through the imported package.
+	try {
+		const found = cliPathFromPackageDir(getPackageDir());
+		if (found) return found;
+	} catch {
+		// getPackageDir can throw in unusual packaging setups: try the others.
+	}
+	// 2. Native resolution, for a checkout with its own node_modules.
+	try {
+		const resolved = import.meta.resolve("@earendil-works/pi-coding-agent");
+		const found = cliPathFromPackageDir(path.dirname(fileURLToPath(resolved)));
+		if (found) return found;
+	} catch {
+		// import.meta.resolve is not available under every transform.
+	}
+	// 3. Walk up from this file for a node_modules copy.
+	let dir = path.dirname(fileURLToPath(import.meta.url));
+	for (;;) {
+		const candidate = path.join(dir, "node_modules", "@earendil-works", "pi-coding-agent");
+		if (existsSync(candidate)) {
+			const found = cliPathFromPackageDir(candidate);
+			if (found) return found;
+		}
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	throw new Error(
+		"pi-team cannot locate the pi CLI entry point. Set the PI_PACKAGE_DIR environment variable to the pi install directory.",
+	);
 }
 
 /** Absolute path to the report_result companion extension. */

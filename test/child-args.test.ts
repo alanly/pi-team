@@ -1,14 +1,17 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import {
 	AUTONOMY_INSTRUCTION,
 	buildChildArgs,
+	cliPathFromPackageDir,
 	composeSystemPrompt,
 	isValidThinkingLevel,
 	parseModelOverride,
 	resolveChildExtensions,
+	resolveCliPath,
 	resolveThinking,
 } from "../src/child-args.ts";
 
@@ -99,6 +102,36 @@ describe("resolveChildExtensions", () => {
 	it("returns an empty list when nothing is installed", async () => {
 		const home = await tempDir();
 		expect(resolveChildExtensions({ childExtensions: [] }, home)).toEqual([]);
+	});
+});
+
+describe("cli path resolution", () => {
+	it("reads bin.pi from package.json", async () => {
+		const dir = await tempDir();
+		await mkdir(join(dir, "dist", "bundle"), { recursive: true });
+		await writeFile(join(dir, "package.json"), JSON.stringify({ bin: { pi: "dist/bundle/cli.js" } }));
+		await writeFile(join(dir, "dist", "bundle", "cli.js"), "");
+		expect(cliPathFromPackageDir(dir)).toBe(join(dir, "dist", "bundle", "cli.js"));
+	});
+
+	it("falls back to dist/cli.js when package.json has no bin", async () => {
+		const dir = await tempDir();
+		await mkdir(join(dir, "dist"), { recursive: true });
+		await writeFile(join(dir, "dist", "cli.js"), "");
+		expect(cliPathFromPackageDir(dir)).toBe(join(dir, "dist", "cli.js"));
+	});
+
+	it("returns undefined when nothing exists", async () => {
+		expect(cliPathFromPackageDir(await tempDir())).toBeUndefined();
+	});
+
+	it("resolveCliPath finds an existing cli.js", () => {
+		// In this checkout node_modules exists, so native resolution would also
+		// work. The important part: getPackageDir is tried first and returns a
+		// real file even when the extension is installed without its own deps.
+		const path = resolveCliPath();
+		expect(existsSync(path)).toBe(true);
+		expect(path.endsWith("cli.js")).toBe(true);
 	});
 });
 
