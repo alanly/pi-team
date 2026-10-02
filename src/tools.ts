@@ -440,6 +440,13 @@ export function registerTools(pi: ExtensionAPI, tools: TeamTools): void {
 			"The teammate works in the background in this workspace. " +
 			"You are notified when it reports. Use team_status to check progress, " +
 			"team_steer to steer or give new tasks, and team_stop to stop it.",
+		promptSnippet:
+			"Start a long-lived background teammate with a task. Returns immediately; you are notified when it reports.",
+		promptGuidelines: [
+			"After team_spawn, end your turn and do not wait. The teammate works in the background.",
+			"Do not poll team_status or team_result in a loop to wait for a teammate to finish.",
+			"A team-notify message starts your next turn when a teammate reports. Then call team_result to pull the deliverable.",
+		],
 		executionMode: "sequential",
 		parameters: Type.Object({
 			task: Type.String({ description: "The task text. Include all context that the teammate needs." }),
@@ -465,6 +472,7 @@ export function registerTools(pi: ExtensionAPI, tools: TeamTools): void {
 		description:
 			"Get the state of one teammate, or of all teammates. " +
 			"Omit teammate for all. Set detail to true for the activity ring and live RPC data.",
+		promptSnippet: "Show the state of one or all teammates (non-blocking).",
 		executionMode: "sequential",
 		parameters: Type.Object({
 			teammate: Type.Optional(Type.String({ description: "Specific teammate; omit = all." })),
@@ -481,6 +489,7 @@ export function registerTools(pi: ExtensionAPI, tools: TeamTools): void {
 		description:
 			"Pull the stored deliverable of a teammate. Reads are repeatable and do not delete data. " +
 			"If the teammate is running, the tool says that it is still working.",
+		promptSnippet: "Pull a teammate's stored deliverable (non-blocking, repeatable).",
 		executionMode: "sequential",
 		parameters: Type.Object({
 			teammate: Type.String({ description: "The teammate name. Required." }),
@@ -497,6 +506,7 @@ export function registerTools(pi: ExtensionAPI, tools: TeamTools): void {
 			"Steer a running teammate or give a new task to an idle teammate. " +
 			"mode interrupt steers the current turn. mode queue waits for the current turn to end. " +
 			"An idle teammate keeps its prior context.",
+		promptSnippet: "Steer a running teammate or give an idle teammate a new task.",
 		executionMode: "sequential",
 		parameters: Type.Object({
 			teammate: Type.String({ description: "The teammate name." }),
@@ -517,6 +527,7 @@ export function registerTools(pi: ExtensionAPI, tools: TeamTools): void {
 		description:
 			"Stop a teammate and remove it. Give a teammate name or set all to true. " +
 			"The client sends SIGTERM, then SIGKILL. The operation is idempotent.",
+		promptSnippet: "Stop a teammate by name, or all teammates, and remove it.",
 		executionMode: "sequential",
 		parameters: Type.Object({
 			teammate: Type.Optional(Type.String({ description: "The teammate name." })),
