@@ -73,7 +73,7 @@ export class FakeClient implements RpcClientLike {
 export interface MockPi {
 	pi: ExtensionAPI;
 	calls: {
-		tools: Array<{ name: string; namespace?: { name: string }; executionMode?: string }>;
+		tools: Array<{ name: string; namespace?: { name: string }; executionMode?: string; parameters?: unknown }>;
 		renderers: Array<[string, unknown]>;
 		events: Array<[string, unknown]>;
 		messages: unknown[][];

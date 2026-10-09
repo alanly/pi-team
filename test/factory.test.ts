@@ -38,6 +38,10 @@ describe("factory smoke test", () => {
 			expect(tool.namespace?.name).toBe("team");
 			expect(tool.executionMode).toBe("sequential");
 		}
+		const spawn = calls.tools.find((tool) => tool.name === "team_spawn");
+		expect(Object.keys((spawn?.parameters as { properties?: Record<string, unknown> }).properties ?? {})).toEqual(
+			expect.arrayContaining(["extensions"]),
+		);
 		expect(calls.renderers.map(([customType]) => customType)).toEqual(["team-notify"]);
 		expect(calls.events.map(([event]) => event)).toEqual([
 			"session_start",

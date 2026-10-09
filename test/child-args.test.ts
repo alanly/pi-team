@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import {
 	AUTONOMY_INSTRUCTION,
+	mergeChildExtensions,
 	buildChildArgs,
 	cliPathFromPackageDir,
 	composeSystemPrompt,
@@ -81,6 +82,20 @@ describe("buildChildArgs", () => {
 	it("omits the tools flag when the list is absent or empty", () => {
 		expect(buildChildArgs({ reportResultPath: "/r.ts" })).not.toContain("--tools");
 		expect(buildChildArgs({ reportResultPath: "/r.ts", tools: [] })).not.toContain("--tools");
+	});
+});
+
+describe("mergeChildExtensions", () => {
+	it("appends the provided extensions after the defaults without duplicates", () => {
+		expect(mergeChildExtensions(["/ext/ollama.ts"], ["/ext/ollama.ts", "/work/ext/search.ts"])).toEqual([
+			"/ext/ollama.ts",
+			"/work/ext/search.ts",
+		]);
+	});
+
+	it("returns the defaults when the provided list is empty", () => {
+		expect(mergeChildExtensions(["/ext/ollama.ts"], [])).toEqual(["/ext/ollama.ts"]);
+		expect(mergeChildExtensions([], [])).toEqual([]);
 	});
 });
 

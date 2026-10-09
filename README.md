@@ -23,7 +23,7 @@ Add the package to the pi settings:
 
 | Tool | Purpose |
 |---|---|
-| `team_spawn` | Start a teammate with a task. |
+| `team_spawn` | Start a teammate with a task. Optional `tools` allowlist, `extensions` paths, `model`, and `thinking` overrides. |
 | `team_status` | Read the state of one teammate or of all teammates. |
 | `team_result` | Pull the stored deliverable of a teammate. |
 | `team_steer` | Steer a running teammate, or give a new task to an idle teammate. |
@@ -50,6 +50,8 @@ The extension reads the `piTeam` block. Pi merges the global settings and the pr
 | `childExtensions` | `[]` | Extra child extensions (`-e` paths). An empty list enables automatic detection. |
 
 Automatic detection adds `~/.pi/agent/npm/node_modules/pi-ollama-cloud/index.ts` when the file exists. Reason: the default parent provider comes from an extension, and a clean child cannot resolve it.
+
+The `extensions` parameter of `team_spawn` loads extra extensions in one child. The paths merge with the resolved list above (duplicates drop). File paths resolve against the workspace and must exist, or the spawn fails with a clear error. `builtin:<name>` values pass through without a file check.
 
 ## Result delivery
 

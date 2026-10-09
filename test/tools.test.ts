@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import type { RpcClientOptions } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { ParentActivity, TeamNotify } from "../src/notify.ts";
@@ -8,6 +11,18 @@ import { StatusLine } from "../src/statusline.ts";
 import { TeamTools } from "../src/tools.ts";
 import type { PiTeamConfig } from "../src/types.ts";
 import { FakeClient, mockContext, mockPi } from "./fakes.ts";
+
+const tempDirs: string[] = [];
+async function writeExtensionFile(): Promise<string> {
+	const dir = await mkdtemp(join(tmpdir(), "pi-team-tools-"));
+	tempDirs.push(dir);
+	const extPath = join(dir, "helper.ts");
+	await writeFile(extPath, "export default () => {}\n");
+	return extPath;
+}
+afterAll(async () => {
+	await Promise.allSettled(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
+});
 
 function setup(client: FakeClient = new FakeClient(), config: PiTeamConfig = { ...DEFAULT_CONFIG, maxTeammates: 2 }) {
 	const { pi, calls } = mockPi();
@@ -66,6 +81,23 @@ describe("team_spawn", () => {
 		const result = await tools.spawn({ task: "x" }, ctx);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toContain("limit (2)");
+	});
+
+	it("passes the extensions list to the child", async () => {
+		const extPath = await writeExtensionFile();
+		const { tools, registry, seen, ctx } = setup();
+		const result = await tools.spawn({ task: "x", extensions: [extPath] }, ctx);
+		expect(result.isError).toBeFalsy();
+		expect(registry.size).toBe(1);
+		expect(seen[0]?.args).toContain(extPath);
+	});
+
+	it("returns an error and adds no teammate when an extension path does not exist", async () => {
+		const { tools, registry, ctx } = setup();
+		const result = await tools.spawn({ task: "x", extensions: ["/no/such/missing.ts"] }, ctx);
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toContain("/no/such/missing.ts");
+		expect(registry.size).toBe(0);
 	});
 
 	it("returns a clear error when the child fails at startup", async () => {

@@ -68,6 +68,14 @@ export function buildChildArgs(input: ChildArgsInput): string[] {
 }
 
 /**
+ * Merge the parent-provided extension paths into the resolved list. The
+ * defaults keep their order; provided paths follow; duplicates drop.
+ */
+export function mergeChildExtensions(resolved: readonly string[], provided: readonly string[]): string[] {
+	return [...new Set([...resolved, ...provided])];
+}
+
+/**
  * Extra -e paths for provider extensions. The config value wins when it is
  * not empty. Otherwise the function detects the installed ollama-cloud
  * extension because the parent default provider comes from it.

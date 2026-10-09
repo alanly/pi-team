@@ -52,6 +52,7 @@ export interface SpawnParams {
 	name?: string;
 	systemPrompt?: string;
 	tools?: string[];
+	extensions?: string[];
 	model?: string;
 	thinking?: string;
 }
@@ -128,6 +129,7 @@ export class TeamTools {
 				cwd: ctx.cwd,
 				systemPrompt: params.systemPrompt,
 				tools: params.tools,
+				extensions: params.extensions,
 				model,
 				thinking,
 			});
@@ -457,6 +459,14 @@ export function registerTools(pi: ExtensionAPI, tools: TeamTools): void {
 					description:
 						"Optional tool allowlist. Pass exact tool names only; the child ignores unknown names. " +
 						"report_result is always added.",
+				}),
+			),
+			extensions: Type.Optional(
+				Type.Array(Type.String(), {
+					description:
+					"Optional extension paths the child loads in addition to the configured ones. " +
+					"Absolute or workspace-relative file paths, or builtin:<name>. " +
+					"The spawn fails when a file path does not exist.",
 				}),
 			),
 			model: Type.Optional(Type.String({ description: "Model override, for example provider/model. Default: parent model." })),

@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { spawnTeamMate, TeamMateProcess, TeamSpawnError, type SpawnTeamMateDeps } from "../src/process.ts";
 import type { RpcClientOptions } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG } from "../src/config.ts";
@@ -205,6 +208,80 @@ describe("spawnTeamMate", () => {
 		const deps = spawnDeps(client);
 		await expect(spawnTeamMate(deps, { name: "beta", task: "x", cwd: "/work" })).rejects.toBeInstanceOf(TeamSpawnError);
 		expect(deps.removePersona).toHaveBeenCalledWith("/tmp/persona/system-prompt.md");
+	});
+
+	describe("provided extensions", () => {
+		const dirs: string[] = [];
+		async function tempDir(): Promise<string> {
+			const dir = await mkdtemp(join(tmpdir(), "pi-team-spawn-"));
+			dirs.push(dir);
+			return dir;
+		}
+		afterAll(async () => {
+			await Promise.allSettled(dirs.map((dir) => rm(dir, { recursive: true, force: true })));
+		});
+
+		async function writeExtension(dir: string, name: string): Promise<string> {
+			const extPath = join(dir, name);
+			await writeFile(extPath, "export default () => {}\n");
+			return extPath;
+		}
+
+		it("merges the provided extensions with the resolved defaults", async () => {
+			const dir = await tempDir();
+			const extPath = await writeExtension(dir, "search.ts");
+			const client = new FakeClient();
+			const seen: RpcClientOptions[] = [];
+			const deps = spawnDeps(client, seen);
+			await spawnTeamMate(deps, { name: "beta", task: "x", cwd: dir, extensions: [extPath] });
+			const args = seen[0]?.args ?? [];
+			expect(args).toContain("/ext/ollama.ts");
+			expect(args).toContain(extPath);
+			expect(args.indexOf("/ext/ollama.ts")).toBeLessThan(args.indexOf(extPath));
+		});
+
+		it("does not duplicate an extension the defaults already resolve", async () => {
+			const dir = await tempDir();
+			const extPath = await writeExtension(dir, "shared.ts");
+			const client = new FakeClient();
+			const seen: RpcClientOptions[] = [];
+			const deps = { ...spawnDeps(client, seen), resolveChildExtensions: () => [extPath] };
+			await spawnTeamMate(deps, { name: "beta", task: "x", cwd: dir, extensions: [extPath] });
+			expect((seen[0]?.args ?? []).filter((arg) => arg === extPath)).toHaveLength(1);
+		});
+
+		it("resolves a relative path against the cwd", async () => {
+			const dir = await tempDir();
+			await writeExtension(dir, "search.ts");
+			const client = new FakeClient();
+			const seen: RpcClientOptions[] = [];
+			const deps = spawnDeps(client, seen);
+			await spawnTeamMate(deps, { name: "beta", task: "x", cwd: dir, extensions: ["./search.ts"] });
+			expect(seen[0]?.args).toContain(join(dir, "search.ts"));
+		});
+
+		it("passes builtin: paths through without a disk check", async () => {
+			const client = new FakeClient();
+			const seen: RpcClientOptions[] = [];
+			const deps = spawnDeps(client, seen);
+			await spawnTeamMate(deps, { name: "beta", task: "x", cwd: "/work", extensions: ["builtin:mcp"] });
+			expect(seen[0]?.args).toContain("builtin:mcp");
+		});
+
+		it("fails the spawn with the missing paths when a file does not exist", async () => {
+			const dir = await tempDir();
+			const client = new FakeClient();
+			const deps = spawnDeps(client);
+			const badSpawn = spawnTeamMate(deps, {
+				name: "beta",
+				task: "x",
+				cwd: dir,
+				extensions: [join(dir, "missing.ts")],
+			});
+			await expect(badSpawn).rejects.toBeInstanceOf(TeamSpawnError);
+			await expect(badSpawn).rejects.toThrowError(/missing\.ts/);
+			expect(client.started).toBe(false);
+		});
 	});
 
 	it("stops the child and removes the entry when the first prompt is handled", async () => {

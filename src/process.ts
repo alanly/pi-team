@@ -7,6 +7,8 @@
  */
 
 import type { RpcClientOptions } from "@earendil-works/pi-coding-agent";
+import { existsSync } from "node:fs";
+import * as path from "node:path";
 import type {
 	ActivityEvent,
 	Deliverable,
@@ -17,7 +19,7 @@ import type {
 	TeamMateEvent,
 	TeamMateState,
 } from "./types.ts";
-import { buildChildArgs, composeSystemPrompt } from "./child-args.ts";
+import { buildChildArgs, composeSystemPrompt, mergeChildExtensions } from "./child-args.ts";
 
 /** The activity ring keeps the newest 10 notable events. */
 export const ACTIVITY_CAPACITY = 10;
@@ -476,6 +478,8 @@ export interface SpawnTeamMateSpec {
 	cwd: string;
 	systemPrompt?: string;
 	tools?: string[];
+	/** Extension paths the parent asked to load, in addition to the configured ones. */
+	extensions?: string[];
 	/** Resolved model, when one exists. */
 	model?: { provider?: string; id?: string };
 	thinking?: string;
@@ -484,6 +488,28 @@ export interface SpawnTeamMateSpec {
 /** Error text a spawn failure carries back to the tool. */
 export class TeamSpawnError extends Error {}
 
+/** True for -e values that do not name a file, such as builtin:mcp. */
+function isSyntheticExtensionPath(value: string): boolean {
+	return value.startsWith("builtin:") || value.startsWith("<");
+}
+
+/** Resolve provided paths against cwd and reject missing files before the child starts. */
+function resolveProvidedExtensions(name: string, cwd: string, provided: string[]): string[] {
+	const missing: string[] = [];
+	const resolved = provided.map((raw) => {
+		if (isSyntheticExtensionPath(raw)) return raw;
+		const resolvedPath = path.resolve(cwd, raw);
+		if (!existsSync(resolvedPath)) missing.push(raw);
+		return resolvedPath;
+	});
+	if (missing.length > 0) {
+		throw new TeamSpawnError(
+			`The teammate "${name}" cannot start: extension file(s) not found: ${missing.join(", ")}`,
+		);
+	}
+	return resolved;
+}
+
 /**
  * Build the child arguments, start the RpcClient, and send the first
  * prompt. Any failure stops the child and removes the temporary persona
@@ -491,10 +517,14 @@ export class TeamSpawnError extends Error {}
  */
 export async function spawnTeamMate(deps: SpawnTeamMateDeps, spec: SpawnTeamMateSpec): Promise<TeamMateProcess> {
 	const personaFile = await deps.writePersona(composeSystemPrompt(spec.systemPrompt));
+	const providedExtensions = spec.extensions?.length
+		? resolveProvidedExtensions(spec.name, spec.cwd, spec.extensions)
+		: [];
+	const childExtensions = mergeChildExtensions(deps.resolveChildExtensions(deps.config), providedExtensions);
 	const args = buildChildArgs({
 		reportResultPath: deps.reportResultPath,
 		personaFile,
-		childExtensions: deps.resolveChildExtensions(deps.config),
+		childExtensions,
 		thinking: spec.thinking,
 		tools: spec.tools,
 	});

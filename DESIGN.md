@@ -201,7 +201,7 @@ new RpcClient({
     "--no-extensions",             // clean child: no parent extensions (incl. pi-team) - explicit -e still works
     "--no-skills", "--no-prompt-templates", "--no-context-files",
     "-e", <abs path to src/report-result.ts>,
-    ...childExtensions.flatMap(p => ["-e", p]),   // provider extensions, see §5.2
+    ...childExtensions.flatMap(p => ["-e", p]),   // resolved (§5.2) + parent-provided (§8.1) extensions, deduped
     "--append-system-prompt", <tmp persona file>, // persona + §4.3 instruction; tmp file (long text)
     "--thinking", <level>,        // inherited with the model when applicable
     ...(tools ? ["--tools", tools.join(",") + ",report_result"] : []),
@@ -226,6 +226,8 @@ v1 has no model:thinking suffix. `team_spawn` takes separate `model` and `thinki
 Problem: the default parent provider (`ollama-cloud`) comes from an extension. The child runs with `--no-extensions`. Because of this, the child cannot resolve the inherited model.
 
 Solution: the `childExtensions` config supplies extra `-e` paths. Default: the extension checks for `~/.pi/agent/npm/node_modules/pi-ollama-cloud/index.ts`. If the file exists, the extension adds it. The `piTeam.childExtensions` config overrides the list. The extension uses the installed path, not the npm: specifier. This avoids questions about downloads.
+
+The `extensions` parameter of `team_spawn` (§8.1) adds per-spawn paths on top of this resolved list. The merge keeps the resolved order first and drops duplicates. File paths resolve against the spawn cwd and must exist, or the spawn fails before the child process starts. `builtin:<name>` values pass through without a disk check.
 
 ### 5.3 Headless guarantees
 
@@ -301,6 +303,7 @@ The extension registers all tools with `pi.registerTool`. All tools use `executi
 | `name` | string? | Unique name. Default: `teammate-<n>`. The tool rejects duplicates. |
 | `systemPrompt` | string? | Persona text. The extension appends it to the child system prompt. |
 | `tools` | string[]? | Tool allowlist. The extension appends `report_result`. Omit the list to permit all default tools. The child ignores a name that it does not know. Pass exact tool names. |
+| `extensions` | string[]? | Extension paths the child loads with `-e`, in addition to the resolved child extensions (§5.2). Absolute or cwd-relative file paths, or `builtin:<name>`. File paths resolve against the spawn cwd. The spawn fails with a clear error when a file path does not exist; this happens before the child process starts. The merge drops duplicates. |
 | `model` | string? | Model override. Default: the active parent model. |
 | `thinking` | string? | Thinking level override. Default: the parent thinking level. |
 
@@ -310,6 +313,7 @@ Three error cases exist:
 
 - The child fails at startup. Example: an unknown `--model` value. `client.start()` throws after its internal 100-millisecond check. The tool catches the error, removes the registry entry, and returns a clear error text.
 - The first prompt returns a disposition other than "started" (§4.4). The tool stops the child, removes the registry entry, and returns a clear error text.
+- The extensions parameter names a file that does not exist. The tool returns a clear error text that lists the missing paths, before it starts any child process.
 - The tools parameter can name a tool that the clean child does not have. The child ignores unknown names without an error. The tool description warns the model: pass exact tool names only.
 
 ### 8.2 team_status: check progress
