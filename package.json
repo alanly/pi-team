@@ -1,6 +1,6 @@
 {
   "name": "pi-team",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension: spawn long-lived sub-agent teammates that the main agent can delegate to, monitor, steer, and stop.",
   "type": "module",
   "keywords": [

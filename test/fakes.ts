@@ -4,13 +4,50 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, RpcClientOptions } from "@earendil-works/pi-coding-agent";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { vi } from "vitest";
 import type { PromptDisposition, QueuedInputDisposition, RpcClientLike, TeamMateEvent } from "../src/types.ts";
+
+export function deferred<T>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	return { promise, resolve, reject };
+}
+
+export function assistantMessage(cost = 0, text = "Done."): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "openai-responses",
+		provider: "openai",
+		model: "test-model",
+		usage: {
+			input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15,
+			cost: { input: cost, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+		},
+		stopReason: "stop",
+		timestamp: 123,
+	};
+}
 
 export class FakeClient implements RpcClientLike {
 	listeners = new Set<(event: TeamMateEvent) => void>();
 	started = false;
 	stopped = false;
+	stopCalls = 0;
+	statsCalls = 0;
+	callOrder: string[] = [];
+	stopResponse?: Promise<void>;
+	promptResponse?: Promise<PromptDisposition>;
+	steerResponse?: Promise<QueuedInputDisposition>;
+	followUpResponse?: Promise<QueuedInputDisposition>;
+	stateResponse?: Promise<unknown>;
+	statsResponse?: Promise<unknown>;
+	lastTextResponse?: Promise<string | null>;
 	promptCalls: string[] = [];
 	steerCalls: string[] = [];
 	followUpCalls: string[] = [];
@@ -20,7 +57,7 @@ export class FakeClient implements RpcClientLike {
 	startError?: Error;
 	stateError?: Error;
 	stateResult: unknown = { isStreaming: false };
-	statsResult: unknown = { tokens: { input: 1, output: 2 } };
+	statsResult: unknown = { tokens: { input: 1, output: 2 }, cost: 0 };
 	lastText: string | null = null;
 
 	async start(): Promise<void> {
@@ -29,40 +66,48 @@ export class FakeClient implements RpcClientLike {
 	}
 
 	async stop(): Promise<void> {
+		this.callOrder.push("stop");
+		this.stopCalls++;
 		this.stopped = true;
+		return this.stopResponse;
 	}
 
 	onEvent(listener: (event: TeamMateEvent) => void): () => void {
 		this.listeners.add(listener);
-		return () => this.listeners.delete(listener);
+		return () => {
+			this.callOrder.push("unsubscribe");
+			this.listeners.delete(listener);
+		};
 	}
 
 	async prompt(message: string): Promise<PromptDisposition> {
 		this.promptCalls.push(message);
-		return this.promptDisposition;
+		return this.promptResponse ?? this.promptDisposition;
 	}
 
 	async steer(message: string): Promise<QueuedInputDisposition> {
 		this.steerCalls.push(message);
-		return this.steerDisposition;
+		return this.steerResponse ?? this.steerDisposition;
 	}
 
 	async followUp(message: string): Promise<QueuedInputDisposition> {
 		this.followUpCalls.push(message);
-		return this.followUpDisposition;
+		return this.followUpResponse ?? this.followUpDisposition;
 	}
 
 	async getState(): Promise<unknown> {
 		if (this.stateError) throw this.stateError;
-		return this.stateResult;
+		return this.stateResponse ?? this.stateResult;
 	}
 
 	async getSessionStats(): Promise<unknown> {
-		return this.statsResult;
+		this.callOrder.push("stats");
+		this.statsCalls++;
+		return this.statsResponse ?? this.statsResult;
 	}
 
 	async getLastAssistantText(): Promise<string | null> {
-		return this.lastText;
+		return this.lastTextResponse ?? this.lastText;
 	}
 
 	emit(event: TeamMateEvent): void {

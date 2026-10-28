@@ -27,6 +27,8 @@ export const ACTIVITY_CAPACITY = 10;
 export const RPC_TIMEOUT_MS = 30_000;
 /** Race limit for one health probe. */
 export const PROBE_TIMEOUT_MS = 5_000;
+/** Limit for one cost reconciliation request. */
+export const COST_TIMEOUT_MS = 1_000;
 /** Timeout for the stop call (SIGTERM, then SIGKILL after 1 second). */
 export const STOP_TIMEOUT_MS = 5_000;
 /** Preview length for one activity entry. */
@@ -89,6 +91,15 @@ function preview(value: unknown, max: number = PREVIEW_MAX): string {
 
 const REPORT_STATUSES: ReportStatus[] = ["success", "failure", "blocked"];
 
+interface CostMessage {
+	role?: string;
+	usage?: { cost?: { total?: number } };
+}
+
+function validCost(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
 function captureDeliverable(args: unknown): Deliverable | undefined {
 	if (!args || typeof args !== "object") return undefined;
 	const a = args as { status?: unknown; summary?: unknown; data?: unknown; artifacts?: unknown };
@@ -115,6 +126,7 @@ export interface TeamMateInit {
 	state?: TeamMateState;
 	deliverable?: Deliverable;
 	frozen?: boolean;
+	cost?: number;
 	failureNote?: string;
 	personaFile?: string;
 	client?: RpcClientLike;
@@ -149,6 +161,11 @@ export class TeamMateProcess {
 	private queueFollowUp: readonly string[] = [];
 	private probeFailures = 0;
 	private settleToken = 0;
+	private assistantCost = 0;
+	private additionalCost = 0;
+	private costEpoch = 0;
+	private isClosed = false;
+	private stopPromise?: Promise<void>;
 	private taskStartedAt: number;
 	private onChange?: (mate: TeamMateProcess) => void;
 	private onComplete?: (mate: TeamMateProcess) => void;
@@ -162,6 +179,7 @@ export class TeamMateProcess {
 		this.failureNote = init.failureNote;
 		this.personaFile = init.personaFile;
 		this.frozen = init.frozen ?? false;
+		this.additionalCost = validCost(init.cost) ? init.cost : 0;
 		this.createdAt = Date.now();
 		this.lastEventTs = this.createdAt;
 		this.taskStartedAt = this.createdAt;
@@ -178,6 +196,7 @@ export class TeamMateProcess {
 			task: entry.task,
 			state: interrupted ? "failed" : entry.state,
 			deliverable: entry.deliverable,
+			cost: entry.cost,
 			frozen: true,
 			failureNote: entry.failureNote ?? (interrupted ? note : undefined),
 		});
@@ -185,8 +204,17 @@ export class TeamMateProcess {
 
 	/** Attach the client and subscribe to its event stream. */
 	bind(client: RpcClientLike): void {
+		if (this.closed || this.frozen) return;
 		this.client = client;
 		this.unsubscribe = client.onEvent((event) => this.handleEvent(event));
+	}
+
+	get cost(): number {
+		return this.assistantCost + this.additionalCost;
+	}
+
+	get closed(): boolean {
+		return this.isClosed;
 	}
 
 	/** Latest stored deliverable, when one exists. */
@@ -217,7 +245,7 @@ export class TeamMateProcess {
 	// ---------- event handling ----------
 
 	handleEvent(event: TeamMateEvent): void {
-		if (this.state === "failed") return;
+		if (this.closed || this.frozen || this.state === "failed") return;
 		this.lastEventTs = Date.now();
 		switch (event.type) {
 			case "agent_start":
@@ -229,7 +257,7 @@ export class TeamMateProcess {
 				if (event.willRetry) this.state = "running";
 				break;
 			case "agent_settled":
-				void this.settle();
+				void this.settle().catch(() => undefined);
 				break;
 			case "queue_update": {
 				this.queueSteering = event.steering ?? [];
@@ -254,7 +282,13 @@ export class TeamMateProcess {
 					preview: preview(event.result ?? ""),
 				});
 				break;
-			case "message_end":
+			case "message_end": {
+				const message = event.message as CostMessage | null | undefined;
+				if (message?.role === "assistant") {
+					this.costEpoch++;
+					const cost = message.usage?.cost?.total;
+					if (validCost(cost)) this.assistantCost += cost;
+				}
 				this.pushActivity({
 					ts: this.lastEventTs,
 					kind: "message",
@@ -262,6 +296,7 @@ export class TeamMateProcess {
 					preview: preview(messageText(event.message)),
 				});
 				break;
+			}
 			case "message_update": {
 				const usage = event.usage;
 				if (usage && typeof usage === "object") {
@@ -273,7 +308,7 @@ export class TeamMateProcess {
 			default:
 				break;
 		}
-		this.onChange?.(this);
+		if (!this.closed) this.onChange?.(this);
 	}
 
 	private pushActivity(event: ActivityEvent): void {
@@ -282,7 +317,7 @@ export class TeamMateProcess {
 	}
 
 	private async settle(): Promise<void> {
-		if (this.state === "failed") return;
+		if (this.closed || this.state === "failed" || this.state === "idle") return;
 		// A non-empty queue keeps the teammate running. agent_settled should
 		// not arrive in that case, but this guard keeps the state correct.
 		if (!this.queueEmpty) {
@@ -291,6 +326,7 @@ export class TeamMateProcess {
 			return;
 		}
 		const token = ++this.settleToken;
+		void this.reconcileCost();
 		if (!this.deliverable) {
 			let text = "";
 			try {
@@ -301,30 +337,66 @@ export class TeamMateProcess {
 			}
 			// The state can change during the await: read it fresh.
 			const current = this.state as TeamMateState;
-			if (token !== this.settleToken || current === "failed") return;
+			if (this.closed || token !== this.settleToken || current === "failed") return;
 			if (current !== "running" && current !== "starting") return;
 			this.deliverable = { reported: false, text, capturedAt: Date.now() };
 		}
 		this.state = "idle";
 		this.currentTool = undefined;
 		this.onChange?.(this);
-		this.onComplete?.(this);
+		if (!this.closed) this.onComplete?.(this);
+	}
+
+	private async reconcileCost(final = false): Promise<void> {
+		const client = this.client;
+		if (!client || this.frozen || this.state === "failed" || (!final && this.closed)) return;
+		const assistantCost = this.assistantCost;
+		const epoch = this.costEpoch;
+		try {
+			const stats = await withTimeout(client.getSessionStats(), COST_TIMEOUT_MS, "getSessionStats");
+			if (!final && (this.closed || epoch !== this.costEpoch)) return;
+			const cost = (stats as { cost?: unknown } | null | undefined)?.cost;
+			if (!validCost(cost)) return;
+			const additional = Math.max(this.additionalCost, cost - assistantCost, 0);
+			if (additional === this.additionalCost) return;
+			this.additionalCost = additional;
+			if (!final) this.onChange?.(this);
+		} catch {
+			// Accounting is best-effort; keep the known lifetime total.
+		}
 	}
 
 	// ---------- commands ----------
 
+	private assertOpen(): void {
+		if (this.closed) throw new Error("team mate is closed");
+	}
+
+	private liveClient(): RpcClientLike {
+		this.assertOpen();
+		if (!this.client) throw new Error("team mate has no live client");
+		return this.client;
+	}
+
+	private async command<T>(request: Promise<T>, label: string): Promise<T> {
+		const reply = await withTimeout(request, RPC_TIMEOUT_MS, label);
+		this.assertOpen();
+		return reply;
+	}
+
 	/** The first prompt of a new teammate. The state stays "starting" until agent_start. */
 	async initialPrompt(task: string): Promise<string> {
+		const client = this.liveClient();
 		this.resetTask(task);
-		if (!this.client) throw new Error("team mate has no live client");
-		return withTimeout(this.client.prompt(task), RPC_TIMEOUT_MS, "prompt");
+		return this.command(client.prompt(task), "prompt");
 	}
 
 	/** A new task for an idle teammate. The state changes to running after "started". */
 	async startTask(task: string): Promise<string> {
+		const client = this.liveClient();
 		this.resetTask(task);
-		if (!this.client) throw new Error("team mate has no live client");
-		const disposition = await withTimeout(this.client.prompt(task), RPC_TIMEOUT_MS, "prompt");
+		const disposition = await this.command(client.prompt(task), "prompt");
+		this.assertOpen();
 		if (disposition === "started") {
 			this.state = "running";
 			this.onChange?.(this);
@@ -333,13 +405,11 @@ export class TeamMateProcess {
 	}
 
 	async steer(message: string): Promise<string> {
-		if (!this.client) throw new Error("team mate has no live client");
-		return withTimeout(this.client.steer(message), RPC_TIMEOUT_MS, "steer");
+		return this.command(this.liveClient().steer(message), "steer");
 	}
 
 	async queue(message: string): Promise<string> {
-		if (!this.client) throw new Error("team mate has no live client");
-		return withTimeout(this.client.followUp(message), RPC_TIMEOUT_MS, "followUp");
+		return this.command(this.liveClient().followUp(message), "followUp");
 	}
 
 	/** Reset the per-task data when a new task starts. */
@@ -353,16 +423,26 @@ export class TeamMateProcess {
 	}
 
 	/** team_stop: stop the child process. Idempotent. */
-	async stop(): Promise<void> {
-		this.unsubscribe?.();
-		this.unsubscribe = undefined;
+	stop(): Promise<void> {
+		if (this.stopPromise) return this.stopPromise;
+		this.isClosed = true;
+		this.settleToken++;
+		this.disposeListener();
+		this.stopPromise = this.finalizeStop();
+		return this.stopPromise;
+	}
+
+	private async finalizeStop(): Promise<void> {
 		const client = this.client;
 		if (!client) return;
 		try {
-			await withTimeout(client.stop(), STOP_TIMEOUT_MS, "stop");
-		} catch {
-			// stop() clears its request map without rejecting pending calls. A
-			// timeout or a stop error on this path is not fatal.
+			if (!this.frozen && this.state !== "failed") await this.reconcileCost(true);
+		} finally {
+			try {
+				await withTimeout(client.stop(), STOP_TIMEOUT_MS, "stop");
+			} catch {
+				// stop() can leave RPC requests unresolved; termination stays bounded.
+			}
 		}
 	}
 
@@ -381,13 +461,16 @@ export class TeamMateProcess {
 	async probe(): Promise<"alive" | "failed"> {
 		if (this.frozen) return "alive";
 		if (this.state === "failed") return "failed";
+		if (this.closed) return "alive";
 		const client = this.client;
 		if (!client) return "alive";
 		try {
 			await withTimeout(client.getState(), PROBE_TIMEOUT_MS, "health probe");
+			if (this.closed) return (this.state as TeamMateState) === "failed" ? "failed" : "alive";
 			this.probeFailures = 0;
 			return "alive";
 		} catch (error) {
+			if (this.closed) return (this.state as TeamMateState) === "failed" ? "failed" : "alive";
 			const message = error instanceof Error ? error.message : String(error);
 			if (isProcessExitError(error)) return this.markFailed(message);
 			this.probeFailures++;
@@ -398,12 +481,14 @@ export class TeamMateProcess {
 
 	/** Set the failed state, stop the child with a timeout, and ignore stop errors. */
 	markFailed(note: string): "failed" {
-		if (this.state === "failed") return "failed";
+		if (this.closed || this.state === "failed") return "failed";
 		this.state = "failed";
 		this.failureNote = note;
-		const client = this.client;
-		if (client) void withTimeout(client.stop(), STOP_TIMEOUT_MS, "stop").catch(() => undefined);
-		this.onChange?.(this);
+		try {
+			this.onChange?.(this);
+		} finally {
+			void this.stop();
+		}
 		return "failed";
 	}
 
@@ -438,12 +523,16 @@ export class TeamMateProcess {
 
 	/** Live RPC state, for team_status with detail. */
 	async liveState(): Promise<unknown> {
-		return this.client ? withTimeout(this.client.getState(), RPC_TIMEOUT_MS, "getState") : undefined;
+		if (this.closed || !this.client) return undefined;
+		const state = await withTimeout(this.client.getState(), RPC_TIMEOUT_MS, "getState");
+		return this.closed ? undefined : state;
 	}
 
 	/** Live session stats, for team_status with detail. */
 	async liveStats(): Promise<unknown> {
-		return this.client ? withTimeout(this.client.getSessionStats(), RPC_TIMEOUT_MS, "getSessionStats") : undefined;
+		if (this.closed || !this.client) return undefined;
+		const stats = await withTimeout(this.client.getSessionStats(), RPC_TIMEOUT_MS, "getSessionStats");
+		return this.closed ? undefined : stats;
 	}
 
 	/** Persisted form. */
@@ -452,6 +541,7 @@ export class TeamMateProcess {
 			name: this.name,
 			state: this.state,
 			task: this.task,
+			cost: this.cost,
 			...(this.deliverable ? { deliverable: this.deliverable } : {}),
 			...(this.failureNote ? { failureNote: this.failureNote } : {}),
 		};
@@ -598,6 +688,8 @@ export interface LivenessPollerDeps {
  */
 export class LivenessPoller {
 	private timer?: ReturnType<typeof setInterval>;
+	private stopped = false;
+	private tickToken = 0;
 	private readonly setIntervalFn: typeof setInterval;
 	private readonly clearIntervalFn: typeof clearInterval;
 
@@ -613,6 +705,7 @@ export class LivenessPoller {
 			return;
 		}
 		if (this.timer) return;
+		this.stopped = false;
 		const intervalMs = typeof this.deps.intervalMs === "function" ? this.deps.intervalMs() : this.deps.intervalMs;
 		this.timer = this.setIntervalFn(() => void this.tick(), intervalMs);
 		// Do not keep the parent process alive for the probe timer.
@@ -621,15 +714,19 @@ export class LivenessPoller {
 
 	/** Run one probe round now. */
 	async tick(): Promise<void> {
+		if (this.stopped) return;
 		if (this.deps.registry.size === 0) {
 			this.stop();
 			return;
 		}
+		const token = this.tickToken;
 		await Promise.all(this.deps.registry.all().map((mate) => mate.probe()));
-		this.deps.onStateChange();
+		if (!this.stopped && token === this.tickToken) this.deps.onStateChange();
 	}
 
 	stop(): void {
+		this.stopped = true;
+		this.tickToken++;
 		if (this.timer) {
 			this.clearIntervalFn(this.timer);
 			this.timer = undefined;

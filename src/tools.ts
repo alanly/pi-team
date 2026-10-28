@@ -83,6 +83,7 @@ export class TeamTools {
 
 	/** Refresh the status line, persist, and keep the health probe timer current. */
 	private changed(): void {
+		if (this.deps.registry.closed) return;
 		this.deps.statusline.refresh();
 		this.deps.registry.persist();
 		this.deps.onRegistryChange?.();
@@ -99,6 +100,7 @@ export class TeamTools {
 			config: this.deps.getConfig(),
 			onChange: () => this.changed(),
 			onComplete: (mate) => {
+				if (this.deps.registry.closed) return;
 				this.deps.notify.deliver(mate);
 				this.changed();
 			},
@@ -109,6 +111,7 @@ export class TeamTools {
 
 	async spawn(params: SpawnParams, ctx: ExtensionContext): Promise<ToolResult> {
 		const { registry, pi } = this.deps;
+		if (registry.closed) return error("The parent session has ended.");
 		const config = this.deps.getConfig();
 		const name = params.name?.trim() || registry.nextName();
 		if (registry.has(name)) {
@@ -136,6 +139,10 @@ export class TeamTools {
 		} catch (err) {
 			const message = err instanceof TeamSpawnError || err instanceof Error ? err.message : String(err);
 			return error(message);
+		}
+		if (registry.closed) {
+			await this.stopOne(mate);
+			return error("The parent session ended while the teammate was starting.");
 		}
 		registry.add(mate);
 		this.changed();
@@ -297,6 +304,7 @@ export class TeamTools {
 	// ---------- team_steer ----------
 
 	async steer(params: SteerParams, _ctx: ExtensionContext): Promise<ToolResult> {
+		if (this.deps.registry.closed) return error("The parent session has ended.");
 		const mate = this.deps.registry.get(params.teammate);
 		if (!mate) return error(`No teammate named "${params.teammate}".`);
 		if (mate.frozen) {
@@ -314,6 +322,7 @@ export class TeamTools {
 				} catch (err) {
 					return error(`Prompt to "${mate.name}" failed: ${errText(err)}`);
 				}
+				if (this.deps.registry.closed || mate.closed) return error("The teammate has stopped.");
 				if (disposition !== "started") return this.dispositionError(mate, "prompt", disposition);
 				this.changed();
 				return {
@@ -330,6 +339,7 @@ export class TeamTools {
 				} catch (err) {
 					return error(`${action} to "${mate.name}" failed: ${errText(err)}`);
 				}
+				if (this.deps.registry.closed || mate.closed) return error("The teammate has stopped.");
 				if (disposition !== "queued") return this.dispositionError(mate, action, disposition);
 				this.deps.registry.persist();
 				return {
@@ -357,6 +367,7 @@ export class TeamTools {
 
 	async stop(params: StopParams): Promise<ToolResult> {
 		const { registry } = this.deps;
+		if (registry.closed) return error("The parent session has ended.");
 		if (!params.teammate && !params.all) {
 			return error(`Give a teammate name or set all to true.`);
 		}
@@ -364,7 +375,10 @@ export class TeamTools {
 			const mates = registry.all();
 			if (mates.length === 0) return { content: text("No teammates to stop."), details: { counts: registry.counts() } };
 			await Promise.all(mates.map((mate) => this.stopOne(mate)));
-			for (const mate of mates) registry.remove(mate.name);
+			if (registry.closed) return error("The parent session has ended.");
+			for (const mate of mates) {
+				if (registry.get(mate.name) === mate) registry.remove(mate.name);
+			}
 			this.changed();
 			return {
 				content: text(`Stopped ${mates.length} teammate${mates.length === 1 ? "" : "s"}.`),
@@ -375,7 +389,8 @@ export class TeamTools {
 		if (!mate) return error(`No teammate named "${params.teammate}".`);
 		const wasRunning = mate.state === "running" || mate.state === "starting";
 		await this.stopOne(mate);
-		registry.remove(mate.name);
+		if (registry.closed) return error("The parent session has ended.");
+		if (registry.get(mate.name) === mate) registry.remove(mate.name);
 		this.changed();
 		return {
 			content: text(

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { LivenessPoller, TeamMateProcess } from "../src/process.ts";
-import { FakeClient } from "./fakes.ts";
+import { deferred, FakeClient } from "./fakes.ts";
 
 function fakeRegistry() {
 	const mates: TeamMateProcess[] = [];
@@ -65,6 +65,33 @@ describe("LivenessPoller", () => {
 		await poller.tick();
 		expect(onStateChange).toHaveBeenCalledTimes(1);
 		expect(client.stopped).toBe(false);
+	});
+
+	it("suppresses late tick callbacks after stop and can restart", async () => {
+		const registry = fakeRegistry();
+		const client = new FakeClient();
+		const state = deferred<unknown>();
+		client.stateResponse = state.promise;
+		registry.add(new TeamMateProcess({ name: "a", task: "t", client }));
+		const onStateChange = vi.fn();
+		const setIntervalFn = vi.fn(() => 3 as unknown as ReturnType<typeof setInterval>);
+		const poller = new LivenessPoller({
+			registry, intervalMs: 1000, onStateChange,
+			setInterval: setIntervalFn, clearInterval: vi.fn(),
+		});
+		poller.ensureRunning();
+		const oldTick = poller.tick();
+		poller.stop();
+		poller.ensureRunning();
+		state.resolve({});
+		await oldTick;
+		expect(onStateChange).not.toHaveBeenCalled();
+		await poller.tick();
+		expect(onStateChange).toHaveBeenCalledTimes(1);
+		expect(setIntervalFn).toHaveBeenCalledTimes(2);
+		poller.stop();
+		await poller.tick();
+		expect(onStateChange).toHaveBeenCalledTimes(1);
 	});
 
 	it("stops the timer when the registry becomes empty on a tick", async () => {
