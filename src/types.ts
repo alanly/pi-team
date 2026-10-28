@@ -50,10 +50,12 @@ export interface RegistrySnapshotEntry {
 	task: string;
 	deliverable?: Deliverable;
 	failureNote?: string;
+	cost?: number;
 }
 
 export interface RegistrySnapshot {
 	teammates: RegistrySnapshotEntry[];
+	totalCost?: number;
 }
 
 /** The settings.json "piTeam" block, after normalization. */
@@ -85,6 +87,7 @@ export interface TeamMateEvent {
 		cacheRead?: number;
 		cacheWrite?: number;
 		total?: number;
+		cost?: { total?: number };
 	};
 	[key: string]: unknown;
 }

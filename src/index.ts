@@ -33,7 +33,6 @@ import {
 	CT_TEAM_REGISTRY,
 	type PiTeamConfig,
 	type RegistrySnapshot,
-	type RegistrySnapshotEntry,
 	type RpcClientLike,
 } from "./types.ts";
 
@@ -94,13 +93,13 @@ export function restoreNote(reason: SessionStartEvent["reason"]): string {
 }
 
 /** Read the newest registry snapshot from the session entries. */
-export function readLatestSnapshot(ctx: ExtensionContext): RegistrySnapshotEntry[] | undefined {
+export function readLatestSnapshot(ctx: ExtensionContext): RegistrySnapshot | undefined {
 	const entries = ctx.sessionManager.getEntries();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry.type === "custom" && (entry as { customType?: string }).customType === CT_TEAM_REGISTRY) {
 			const data = (entry as { data?: RegistrySnapshot }).data;
-			return data?.teammates ?? [];
+			return { ...data, teammates: Array.isArray(data?.teammates) ? data.teammates : [] };
 		}
 	}
 	return undefined;
@@ -120,6 +119,7 @@ export function createTeamExtension(pi: ExtensionAPI, overrides: TeamExtensionOv
 		registry,
 		intervalMs: () => getConfig().livenessIntervalMs,
 		onStateChange: () => {
+			if (registry.closed) return;
 			statusline.refresh();
 			registry.persist();
 		},
@@ -136,7 +136,9 @@ export function createTeamExtension(pi: ExtensionAPI, overrides: TeamExtensionOv
 		resolveCliPath: overrides.resolveCliPath ?? resolveCliPath,
 		resolveChildExtensions: overrides.resolveChildExtensions ?? resolveChildExtensions,
 		reportResultPath: overrides.reportResultPath ?? resolveReportResultPath(),
-		onRegistryChange: () => poller.ensureRunning(),
+		onRegistryChange: () => {
+			if (!registry.closed) poller.ensureRunning();
+		},
 	});
 
 	// Recursion guard: the child environment sets PI_TEAMMATE=1.
@@ -161,14 +163,13 @@ export function createTeamExtension(pi: ExtensionAPI, overrides: TeamExtensionOv
 		return new Text(`🔔 team ${name}${status}${preview}`, 0, 0);
 	});
 
-	let shuttingDown = false;
+	let shutdownPromise: Promise<void> | undefined;
 
-	// ctx is not a factory parameter: capture it at session_start. Pi fires
-	// session_start again after a session switch, so the copy stays fresh.
 	pi.on("session_start", async (event, ctx) => {
+		if (registry.closed) return;
 		registry.captureContext(ctx);
 		const snapshot = readLatestSnapshot(ctx);
-		if (snapshot && snapshot.length > 0) {
+		if (snapshot) {
 			registry.restore(snapshot, restoreNote(event.reason));
 			registry.persistNow();
 		}
@@ -177,25 +178,30 @@ export function createTeamExtension(pi: ExtensionAPI, overrides: TeamExtensionOv
 	});
 
 	pi.on("agent_start", async () => {
-		activity.markBusy();
+		if (!registry.closed) activity.markBusy();
 	});
 	pi.on("agent_settled", async () => {
-		activity.markIdle();
+		if (!registry.closed) activity.markIdle();
 	});
 
-	// Idempotent cleanup: stop all teammates in parallel, then clear the
-	// status line. This path appends no registry entry.
-	pi.on("session_shutdown", async (_event, ctx) => {
-		if (shuttingDown) return;
-		shuttingDown = true;
+	pi.on("session_shutdown", (_event, ctx) => {
+		if (shutdownPromise) return shutdownPromise;
+		registry.close();
 		poller.stop();
 		const mates = registry.all();
-		await registry.stopAll();
-		for (const mate of mates) {
-			if (mate.personaFile) await (overrides.removePersona ?? removePersonaFile)(mate.personaFile).catch(() => undefined);
-		}
-		registry.clear();
-		if (ctx && ctx.mode === "tui") ctx.ui.setStatus(STATUS_KEY, undefined);
+		shutdownPromise = (async () => {
+			try {
+				await registry.stopAll();
+				await Promise.all(mates.map(async (mate) => {
+					if (mate.personaFile) await (overrides.removePersona ?? removePersonaFile)(mate.personaFile).catch(() => undefined);
+				}));
+				registry.persistFinal();
+			} finally {
+				registry.clear();
+				if (ctx.mode === "tui") ctx.ui.setStatus(STATUS_KEY, undefined);
+			}
+		})();
+		return shutdownPromise;
 	});
 
 	return { registry, statusline, notify, tools, poller, disabled: false };

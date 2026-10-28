@@ -44,6 +44,7 @@ export class TeamNotify {
 	 * flag. The result is stored and appended as a custom entry.
 	 */
 	deliver(mate: TeamMateProcess): void {
+		if (this.deps.registry.closed || mate.closed) return;
 		if (mate.delivered) return;
 		if (mate.state !== "idle") return;
 		mate.delivered = true;

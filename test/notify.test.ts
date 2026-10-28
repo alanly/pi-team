@@ -85,6 +85,18 @@ describe("TeamNotify", () => {
 		expect(calls.messages).toHaveLength(0);
 	});
 
+	it("does not notify after the parent runtime closes", () => {
+		const { notify, registry, calls, notifications } = setup();
+		const mate = idleMate();
+		registry.add(mate);
+		registry.close();
+		notify.deliver(mate);
+		expect(mate.delivered).toBe(false);
+		expect(calls.entries).toHaveLength(0);
+		expect(calls.messages).toHaveLength(0);
+		expect(notifications).toHaveLength(0);
+	});
+
 	it("notifies the human user in TUI mode", () => {
 		const { notify, registry, notifications } = setup();
 		const mate = idleMate();

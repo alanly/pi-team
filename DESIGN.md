@@ -1,6 +1,6 @@
 # Technical design: pi-team
 
-**Status:** The design is complete. No code exists.
+**Status:** Implemented. Version 0.2.0 adds cumulative teammate cost accounting.
 **Target:** Pi 1.0.0 (`@earendil-works/pi-coding-agent`).
 **Repository:** `~/src/github.com/alanly/pi-team`
 
@@ -8,7 +8,7 @@
 
 Pi-team is a Pi extension. The extension lets the main agent start sub-agents. The sub-agents are "teammates". The main agent gives tasks to teammates. It monitors their progress. It steers them during a task. It receives their deliverables as events. It stops them when it decides. Only the main agent interacts with teammates. The human user does not interact with a teammate directly.
 
-A status line shows teammate counts. The line starts with the 🤖 emoji. The line appears only when teammates exist.
+A status line shows teammate counts and cumulative Pi-reported child cost in USD. The line starts with the 🤖 emoji. It remains visible after teammates stop if recorded cost is positive.
 
 ## Abbreviations and terms
 
@@ -59,7 +59,7 @@ A status line shows teammate counts. The line starts with the 🤖 emoji. The li
 | A sub-agent shall communicate its deliverable back to the main agent via an event. | The `report_result` tool in the child reports the deliverable. The parent captures the tool arguments from the RPC event stream. A notification enters the parent conversation. The parent pulls the full deliverable with `team_result`. (§4, §7) |
 | The main agent shall stop a sub-agent at any time. The main agent shall give additional tasks to an idle sub-agent. | Teammates are long-lived. After a task, a teammate becomes idle and stays alive. `team_stop` stops it. `team_steer` gives a new task. (§3, §8.4, §8.5) |
 | The main agent shall steer a sub-agent whenever necessary. | The `team_steer` tool supports interrupt mode and queue mode. (§8.4) |
-| A status line shall appear only when sub-agents exist. The line shall show the count of running sub-agents and the count of idle sub-agents. The line shall start with the 🤖 emoji. | The extension calls `ctx.ui.setStatus("pi-team", text)`. It passes undefined when the registry is empty. The line also shows failed counts when the count is larger than zero. See user decision 4. (§9) |
+| A status line shall show teammate counts and total child cost, including stopped teammates. The line shall start with the 🤖 emoji. | The extension calls `ctx.ui.setStatus("pi-team", text)`. It passes undefined only when no teammates and no positive recorded cost remain. Failed counts appear only when larger than zero. (§9) |
 
 ### 1.2 Confirmed user decisions (October 2026)
 
@@ -67,9 +67,11 @@ A status line shows teammate counts. The line starts with the 🤖 emoji. The li
 
 2. **Teammate definition: task and optional persona, all inline.** No profile files exist. Each spawn call contains the task and optional name, system prompt, tools, and model.
 
-3. **Idle policy: until stopped or session end.** An idle teammate continues to run until `team_stop` stops it or the session ends. An idle child process sends no model requests. It uses no tokens.
+3. **Idle policy: until stopped or session end.** An idle teammate continues to run until `team_stop` stops it or the session ends. Pi can make background cache-warming requests, depending on its settings.
 
 4. **Status line: failures are visible.** The line shows "· N failed" when N is larger than zero. The parent always sees a failed teammate.
+
+5. **Cumulative cost (0.2.0).** The line appends an unlabeled USD total, including follow-up tasks and stopped teammates. A positive total remains visible after all teammates stop.
 
 ## 2. Architecture
 
@@ -264,6 +266,16 @@ The extension wraps every RPC call with a timeout, not only the probes. Reason: 
 
 A stuck teammate stays in running state. `team_status` shows lastEventAgeMs and currentTool. The parent uses this data to decide. It stops a stuck teammate with `team_stop`. The extension clears the timer when the registry becomes empty. It also clears the timer on session shutdown.
 
+### 6.4 Lifetime cost accounting
+
+Each finalized assistant `message_end` contributes `message.usage.cost.total` once. Streaming usage and repeated aggregate events do not contribute. Follow-up tasks retain prior cost. Only finite non-negative numeric values are accepted.
+
+The child tracks finalized assistant cost `E` and additional cost `A`. At settlement, a nonblocking `getSessionStats()` request reconciles tool, compaction, cache-warm, and other session usage with `A = max(A, sessionCost - E_at_request, 0)`. A cost epoch rejects statistics if an assistant response was processed during the request. The total is `E + A`; cumulative statistics are never added directly. Accounting requests have a one-second limit and do not delay completion notifications.
+
+Stopping first seals the child and unsubscribes from events, which freezes `E`. A live non-failed child gets one bounded final statistics request before transport shutdown. Concurrent stops share one operation. Failed children retain the last known cost without another accounting request. Late callbacks cannot revive a stopped child or call a closed parent runtime.
+
+The registry retains removed costs separately from current entries. Its total is retired cost plus the sum of current teammate costs. Parent-agent usage is excluded.
+
 ## 7. Task completion (notify and pull)
 
 The extension sends exactly one notification per completed task. A flag on the task record prevents duplicates. The extension resets the flag when a new task starts.
@@ -347,20 +359,22 @@ One tool covers both cases: steer prompts during a task, and new tasks for an id
 
 ### 8.5 team_stop: stop a teammate
 
-Params: `teammate?: string`, `all?: boolean`. One of the two is required. Each stop call is `client.stop()`. The client sends SIGTERM, then SIGKILL after an internal 1-second wait. The extension does not send signals itself. The process handle is private. With `all: true`, the tool stops all teammates in parallel (`Promise.all`). Reason: one stop call can take up to 1 second, and sequential stops are too slow for 8 teammates. The operation is idempotent. The tool removes the registry entries. This also clears failed entries. The status line refreshes. If the teammate was running, the result text notes that no deliverable will exist.
+Params: `teammate?: string`, `all?: boolean`. One of the two is required. A live non-failed child gets a final cost-statistics request with a one-second limit before `client.stop()`. Accounting failure does not prevent termination. The client sends SIGTERM, then SIGKILL after an internal 1-second wait. The extension does not send signals itself. The process handle is private. With `all: true`, the tool stops all teammates in parallel (`Promise.all`). Reason: one stop call can take up to 1 second, and sequential stops are too slow for 8 teammates. The operation is idempotent. The tool removes the registry entries. This also clears failed entries. The status line refreshes. If the teammate was running, the result text notes that no deliverable will exist.
 
 ## 9. Status line
 
-- API: `ctx.ui.setStatus("pi-team", text)`. The extension calls `setStatus("pi-team", undefined)` when the registry is empty. The line then disappears. The line appears only while teammates exist.
-- Refresh: event-driven. The extension refreshes the line on each state change: spawn, task completion, failure, stop. The health probe is the only timer.
-- Format: the running count includes starting. The line omits segments with a zero count. The failed segment appears only when the count is larger than zero. The extension joins the segments with " · ".
+- API: `ctx.ui.setStatus("pi-team", text)`. The line disappears only when no teammates and no positive recorded cost remain.
+- Refresh: event-driven on state and cost changes. Accounting adds no polling timer. A cost-only line does not keep the health probe running.
+- Format: the running count includes starting. Zero-count segments are omitted. The final segment is USD with three decimal places and no label, in the dim theme color. Internal amounts retain full precision.
 
 ```
-🤖 2 running · 1 idle
-🤖 3 running
-🤖 1 idle · 2 failed
-🤖 1 failed
+🤖 2 running · 1 idle · $0.138
+🤖 3 running · $0.000
+🤖 1 idle · 2 failed · $0.138
+🤖 $0.138
 ```
+
+Pi reports estimates based on configured model prices. Subscription/OAuth usage can be priced at API rates, not actual subscription charges. Zero-priced models and legacy restored entries can show `$0.000`; that does not guarantee free usage. Additional overhead reconciles at settlement/stop. A hard child exit can lose unreported usage; a hard parent kill can lose spend since the latest persisted snapshot. Forks can display the same inherited historical cost in both sessions.
 
 The line starts with the 🤖 emoji. This identifies the line. The convention matches pi-bg-tasks (🧵 prefix).
 
@@ -370,14 +384,14 @@ The extension guards `ctx.mode === "tui"` around setStatus and notify calls. All
 
 `TeamRegistry` (`src/registry.ts`) holds an in-memory map of name to TeamMateProcess. Persistence:
 
-- Each state change appends an entry: `pi.appendEntry("pi-team-registry", {teammates: [...snapshot]})`. Custom entries do not go to the LLM. The extension limits the number of writes per turn. Exception: the session_shutdown path appends nothing (see the session_shutdown rules below).
+- State and cost changes append `pi.appendEntry("pi-team-registry", {teammates: [...snapshot], totalCost})`. Teammate entries include lifetime `cost`. Custom entries do not go to the LLM. Writes are microtask-batched and identical snapshots are skipped. Queued writes are cancelled by an immediate flush or runtime closure.
 - `session_start`: the extension restores the registry from the session file. Live processes do not survive a restart. This is a documented v1 restriction (§12). Restore rules:
   - Read the latest `pi-team-registry` entry with `ctx.sessionManager.getEntries()`.
-  - If the latest entry is empty or no entry exists, restore nothing. An empty entry means that the user stopped the last teammate before the session ended. `team_stop` appends normally (§8.5). The extension shall respect this removal.
-  - Otherwise restore the entries as frozen stubs. Keep the last state, the task, and the deliverables. `team_result` can still read delivered data. Each restored running or starting entry becomes failed. After the restore, append one snapshot with the processed states.
-  - The failure note names the reason from the `session_start` event. The notes are: "parent session restarted" (startup), "parent session reloaded" (reload), "parent session resumed" (resume), "forked session" (fork). A new session has no entries. A fork copies all entries from the source session.
+  - Restore the newest snapshot, including an empty teammate list with historical cost. Never sum snapshots or fall back to an older nonempty list. Missing legacy costs default to zero. Valid per-entry costs are preserved even if the aggregate is absent or lower than their sum.
+  - Restore teammate entries as frozen stubs. Keep the task, deliverables, and cost. `team_result` can still read delivered data. Each restored running or starting entry becomes failed. Persist processed states only if changed.
+  - The failure note names the reason from the `session_start` event. The notes are: "parent session restarted" (startup), "parent session reloaded" (reload), "parent session resumed" (resume), "forked session" (fork). A new session has no entries and starts at zero. A fork inherits the latest snapshot on the copied path, if one exists.
   - A frozen stub has no live client. `team_result` reads the stored deliverable. `team_stop` removes the stub. `team_steer` returns an explicit error for a stub.
-- `session_shutdown`: the extension stops all teammates in parallel (`Promise.all`). Each stop call is `client.stop()` (SIGTERM, then SIGKILL after an internal 1-second wait). This is a confirmed decision from an earlier project. The shutdown path does not append a registry entry. Reason: the stopAll removals are state changes, but a shutdown entry would be empty. A later restore (reload, resume) shall read the last snapshot with the live teammates, not an empty entry. `team_stop` appends normally during a session. The extension clears the health probe and all timers. It clears the status line. The operation is idempotent. The factory itself creates no resource. All process creation happens inside tool execute functions. This obeys the Pi lifecycle rule.
+- `session_shutdown`: close ordinary callbacks and queued persistence first, then stop all teammates in parallel. Preserve the entries until final accounting completes. Append one changed full snapshot with cost and pre-stop metadata before clearing memory, never a post-clear empty snapshot. An unchanged or pristine session needs no write. Clear the health probe and status line. Concurrent shutdown calls share cleanup. Pi invalidates the old runtime afterward; late callbacks must not touch it. The factory starts no processes or timers.
 - `counts()`: {running (starting + running), idle, failed}. The registry is the only data source for the status line counts.
 
 ## 11. Recursion prevention
@@ -427,7 +441,7 @@ pi-team/
                         #   deliverable capture, steer/prompt/stop operations (client injected for tests)
     registry.ts         # TeamRegistry: map, counts, appendEntry persistence, restore, stopAll
     notify.ts           # completion sequence: dedupe, sendMessage, renderer registration, ui.notify
-    statusline.ts       # formatStatusLine(counts) pure function + setStatus glue
+    statusline.ts       # formatStatusLine(counts, totalCost, fg) + setStatus glue
     tools.ts            # team_spawn / team_status / team_result / team_steer / team_stop
     report-result.ts    # companion extension loaded into children (§4.1)
   test/                 # vitest
@@ -438,7 +452,7 @@ Test plan (TDD, vitest, same stack as pi-bg-tasks):
 - Unit tests, pure functions: formatStatusLine matrix (all count combinations, zero-segment rules, failed-only-when-nonzero), registry counts, state transitions (idle to running on a new task, failed on termination), deliverable capture from synthetic event streams, name generation, duplicate name rejection, duplicate notification prevention.
 - Unit tests with a fake client: TeamMateProcess uses a scripted fake client (interface injection). Tests: report, then idle, then notification. No-report fallback. Steer decision table (idle: prompt; running: steer; running: followUp; starting: error; failed: error). Disposition checks (prompt returns "started"; steer and followUp return "queued"; "handled" returns an error). An `agent_end` event with `willRetry: true` keeps the state running. A `queue_update` with empty arrays arrives after the last queued followUp is consumed, and the state changes to idle. Two consecutive probe failures (or a probe process exit error) call `client.stop()`, and the listener ignores later events from the failed teammate. A first prompt with the disposition "handled" stops the child and removes the registry entry.
 - Factory smoke tests: import and factory start create no process. PI_TEAMMATE=1 disables the extension. The factory creates no timer. session_shutdown is idempotent and stops all fake teammates.
-- End-to-end test, manual, in a live pi session: start a slow task; the status line shows "🤖 1 running". Call team_status during the task; it shows the current tool. Steer during the task. The notification arrives while the parent is idle. Pull the deliverable with team_result. Give a new task to the idle teammate; the teammate keeps its context. Stop all teammates; the status line disappears. Stop the parent; no orphan processes remain. Start several teammates at the same time and verify the notifications: the extension uses triggerTurn with deliverAs "followUp" while the parent is idle. Steer a running teammate, then let its turn end without report_result. The fallback notification fires. This is the intended behavior.
+- End-to-end test, manual, in a live pi session: start a slow task; the status line shows "🤖 1 running · $0.000". Call team_status during the task; it shows the current tool. Steer during the task. The notification arrives while the parent is idle. Pull the deliverable with team_result. Give a new task to the idle teammate; the teammate keeps its context. Stop all teammates; a positive total remains as a cost-only line. Reload/resume and verify the recorded total. Stop the parent; no orphan processes remain. Start several teammates at the same time and verify the notifications: the extension uses triggerTurn with deliverAs "followUp" while the parent is idle. Steer a running teammate, then let its turn end without report_result. The fallback notification fires. This is the intended behavior.
 
 ## 15. Verified APIs (pi 1.0.0)
 
@@ -458,5 +472,5 @@ All items below were checked against the installed distribution.
 
 1. All tests pass. `tsc --noEmit` reports no errors.
 2. The manual end-to-end checklist (§14) passes in a live pi session with a live model.
-3. The status line appears on the first spawn, updates on each state change, and disappears when the last teammate stops.
+3. The status line appears on the first spawn, updates on state/cost changes, and retains a positive total after the last teammate stops. Reload/resume restores recorded cost.
 4. A parent restart leaves no orphan processes.

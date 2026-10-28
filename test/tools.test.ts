@@ -49,8 +49,9 @@ function setup(client: FakeClient = new FakeClient(), config: PiTeamConfig = { .
 		reportResultPath: "/repo/src/report-result.ts",
 		onRegistryChange,
 	});
-	const { ctx } = mockContext();
-	return { tools, registry, pi, calls, ctx, client, seen, config, onRegistryChange };
+	const { ctx, statuses } = mockContext();
+	registry.captureContext(ctx);
+	return { tools, registry, pi, calls, ctx, statuses, client, seen, config, onRegistryChange };
 }
 
 describe("team_spawn", () => {
@@ -188,7 +189,7 @@ describe("team_steer decision table", () => {
 
 	it("errors for a frozen stub", async () => {
 		const { tools, registry, ctx } = setup();
-		registry.restore([{ name: "ghost", state: "idle", task: "t" }], "note");
+		registry.restore({ teammates: [{ name: "ghost", state: "idle", task: "t" }] }, "note");
 		const result = await tools.steer({ teammate: "ghost", message: "x" }, ctx);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toContain("frozen");
@@ -231,11 +232,69 @@ describe("team_stop", () => {
 	});
 });
 
+describe("cost retention", () => {
+	it("retains costs across task completion, follow-up, and stop", async () => {
+		const { tools, registry, client, ctx, statuses } = setup();
+		await tools.spawn({ name: "alpha", task: "first" }, ctx);
+		client.emit({ type: "agent_start" });
+		client.emit({ type: "message_end", message: { role: "assistant", usage: { cost: { total: 0.1 } } } });
+		client.emit({ type: "tool_execution_start", toolName: "report_result", args: { status: "success", summary: "done" } });
+		client.statsResult = { cost: 0.13 };
+		client.emit({ type: "agent_settled" });
+		await vi.waitFor(() => expect(registry.totalCost).toBeCloseTo(0.13));
+		await tools.steer({ teammate: "alpha", message: "second" }, ctx);
+		client.emit({ type: "message_end", message: { role: "assistant", usage: { cost: { total: 0.025 } } } });
+		expect(registry.totalCost).toBeCloseTo(0.155);
+		client.statsResult = { cost: 0.16 };
+		await tools.stop({ teammate: "alpha" });
+		expect(registry.size).toBe(0);
+		expect(registry.totalCost).toBeCloseTo(0.16);
+		expect(statuses.at(-1)).toEqual(["pi-team", "🤖 $0.160"]);
+		await tools.stop({ all: true });
+		expect(registry.totalCost).toBeCloseTo(0.16);
+	});
+
+	it("preserves failed and stopped costs when stopping all", async () => {
+		const { tools, registry, statuses } = setup();
+		registry.add(new TeamMateProcess({ name: "a", task: "a", state: "failed", cost: 0.12 }));
+		registry.add(new TeamMateProcess({ name: "b", task: "b", state: "idle", cost: 0.03 }));
+		await tools.stop({ all: true });
+		expect(registry.totalCost).toBeCloseTo(0.15);
+		expect(statuses.at(-1)).toEqual(["pi-team", "🤖 $0.150"]);
+	});
+
+	it("does not remove a replacement after an old stop finishes", async () => {
+		const { tools, registry, client } = setup();
+		let finishStop!: () => void;
+		client.stop = () => new Promise((resolve) => { finishStop = resolve; });
+		const original = new TeamMateProcess({ name: "alpha", task: "old", state: "running", client, cost: 0.1 });
+		registry.add(original);
+		const stopped = tools.stop({ teammate: "alpha" });
+		await vi.waitFor(() => expect(finishStop).toBeDefined());
+		registry.remove("alpha");
+		const replacement = new TeamMateProcess({ name: "alpha", task: "new", state: "running", cost: 0.2 });
+		registry.add(replacement);
+		finishStop();
+		await stopped;
+		expect(registry.get("alpha")).toBe(replacement);
+		expect(registry.totalCost).toBeCloseTo(0.3);
+	});
+});
+
 describe("team_status and team_result", () => {
 	it("reports no teammates", async () => {
 		const { tools } = setup();
 		const status = await tools.status({});
 		expect(status.content[0]?.text).toBe("No teammates.");
+	});
+
+	it("does not reconcile cost from observational detailed statistics", async () => {
+		const { tools, registry, client } = setup();
+		client.statsResult = { cost: 0.9 };
+		const mate = new TeamMateProcess({ name: "alpha", task: "work", state: "running", client, cost: 0.1 });
+		registry.add(mate);
+		await tools.status({ detail: true });
+		expect(registry.totalCost).toBeCloseTo(0.1);
 	});
 
 	it("reports rows for all teammates", async () => {
